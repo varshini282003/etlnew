@@ -1,0 +1,181 @@
+import jwt
+from jwt.jwks_client import PyJWKClient
+from fastapi import Request, HTTPException, status
+from fastapi.security import HTTPBearer
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional, Union
+import re
+from config import settings as main_app_settings
+
+
+class User(BaseModel):
+    """User model from token"""
+    id: str
+    name: str
+    email: str
+    roles: List[str] | None = None
+    #org_code: str | None = None
+    #org_id: str | None = None
+    #country: str | None = None
+    active_role: str | None = None
+
+    # this is supposed to be as per our user data TokenData
+
+class Authorization(HTTPBearer):
+    """Handles Authorization using jwt token"""
+
+    _auth_specific_settings = main_app_settings
+
+    def __init__(self):
+        super().__init__(auto_error=True)
+        if self._auth_specific_settings.AUTH_ENABLED:
+            if self._auth_specific_settings.auth_jwks_uri:
+                self.jwks_client = PyJWKClient(self._auth_specific_settings.auth_jwks_uri)
+            else:
+                raise ValueError("AUTH_JWKS_URI must be set in .env when AUTH_ENABLED is True.")
+        else:
+            self.jwks_client = None
+
+    async def __call__(self, request: Request) -> User:
+        """Get the token and validate it, or bypass if AUTH_ENABLED is False."""
+        if not self._auth_specific_settings.AUTH_ENABLED:
+            return User(id="", name="Sy User", email="systemuser@exqmple.com")
+        token = await self.__get_token(request)
+        user = self.validate(token)
+        
+        # Two-layer check: Extract Active-Role from header
+        active_role = request.headers.get("Active-Role")
+        if active_role:
+            # Map JWT roles to simplified format for comparison
+            mapped_roles = (user.roles or [])
+            
+            # Validate that user holds this role in their token
+            if active_role in mapped_roles:
+                user.active_role = active_role
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"User does not have '{active_role}' role in token. Available roles: {mapped_roles}"
+                )
+        
+        return user
+    
+    # def _map_roles_to_simplified(self, jwt_roles: List[str]) -> List[str]:
+    #     """
+    #     Map JWT roles to simplified format (Admin, Corporate, Expert).
+    #     Only considers eews.hs.* roles (service-specific roles).
+    #     """
+    #     role_map = {
+    #         "eews.hs.admin": "Admin",
+    #         "eews.hs.corporate": "Corporate",
+    #         "eews.hs.expert": "Expert"
+    #     }
+        
+    #     mapped_roles = set()
+    #     for role in jwt_roles:
+    #         # Only process eews.hs.* roles (service-specific)
+    #         if role.startswith("eews.hs."):
+    #             simplified_role = role_map.get(role)
+    #             if simplified_role:
+    #                 mapped_roles.add(simplified_role)
+        
+    #     return list(mapped_roles)
+
+    async def __get_token(self, request: Request):
+        """Get the token from the request header"""
+        credentials = await super().__call__(request)
+        return credentials.credentials
+
+    def validate(self, token: str) -> User:
+        """Validates the token claims"""
+
+        if not self.jwks_client:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Authentication is enabled but JWKS client is not initialized. Check AUTH_JWKS_URI."
+            )
+
+        try:
+            payload = self._validate_jwt(token)
+            return self._validate_payload(payload)
+
+        except Exception as e:
+            raise HTTPException(
+                detail=f"Validation failed : {e}", status_code=status.HTTP_401_UNAUTHORIZED
+            ) from e
+
+    def _validate_jwt(self, token: str) -> dict:
+        """Basic validation of claims of the jwt token"""
+
+        key = self.jwks_client.get_signing_key_from_jwt(token).key
+        
+        audience_to_check = self._auth_specific_settings.auth_api_audience
+        if isinstance(audience_to_check, str):
+            audience_to_check = [audience_to_check]
+
+        payload = jwt.decode(
+            token,
+            key,
+            algorithms=self._auth_specific_settings.auth_algorithms,
+            audience=audience_to_check,
+            issuer=self._auth_specific_settings.auth_issuer_uri,
+            options={"verify_exp": True, "verify_nbf": True, "verify_iat": True}
+        )
+        return payload
+
+    def _validate_payload(self, payload: dict) -> User:
+        """user validation"""
+
+        email = payload.get("mail") or payload.get("upn")
+        raw_name = payload.get("name")
+        processed_name = raw_name
+        if raw_name:
+            if '(' in raw_name:
+                processed_name = raw_name.split('(', 1)[0].strip()
+            else:
+                processed_name = raw_name.strip()
+        name = processed_name
+
+        user_id = payload.get("gid") or payload.get("employee_id") or payload.get("oid") or payload.get("sub")
+        roles = payload.get("roles")
+        org_code = payload.get("org_code")
+        org_id = payload.get("org_id")
+        country = payload.get("country")
+
+        if not user_id or not name or not email:
+             raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token payload missing required user fields (id, name, email). "
+                       "This might be a client credentials token, which is not supported for this endpoint."
+            )
+
+        return User(
+            email=email,
+            name=name,
+            id=user_id,
+            roles=roles,
+          
+        )
+
+
+# Use this object for dependency injection
+AUTHORIZATION_SCHEME = Authorization()
+
+apI-    assessment_id: UUID, session: Session = Depends(get_session), current_user: TokenData = Depends(get_current_user)
+AZURE from fastapi import Depends, HTTPException,status
+from app.auth.authorization import Authorization
+from app.schemas.common import TokenData
+
+async def get_current_auth_user(auth_user: TokenData = Depends(Authorization)) -> TokenData:
+    """
+    Dependency that returns the authenticated user (Pydantic model from JWT payload).
+    This is useful for endpoints that only need basic user info from the token.
+    """
+    if not auth_user or not auth_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials or user ID (employee_id) is missing in token."
+        )
+    return auth_user
+
